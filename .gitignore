@@ -1,0 +1,35 @@
+# Python 运行与工具缓存
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 后台进程日志（nohup ... > xxx.log）
+*.log
+
+# 相机裸帧与录像（v4l2-ctl --stream-to 抓的 NV12/YUV，体积大）
+*.raw
+*.yuv
+*.nv12
+*.mp4
+*.avi
+*.mkv
+
+# 飞控与 ROS 2 记录数据
+*.ulg
+*.bag
+*.db3
+*.mcap
+
+# colcon 编译产物（工作空间放进本仓库时）
+build/
+install/
+log/
+
+# 本机私有配置与凭证
+.env
+.claude/settings.local.json
+.vscode/
+.idea/
