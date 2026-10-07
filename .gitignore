@@ -33,3 +33,6 @@ log/
 .claude/settings.local.json
 .vscode/
 .idea/
+
+# 机载飞行任务的 CSV 遥测日志
+flight_logs/

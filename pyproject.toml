@@ -1,0 +1,21 @@
+[project]
+name = "rm-drone"
+version = "0.1.0"
+description = "RoboMaster 空中机器人机载程序：自主飞行任务与视觉"
+# 鲁班猫板载 Python 是 3.8.10，代码须保持 3.8 兼容
+requires-python = ">=3.8"
+dependencies = [
+    # 2.4.47 是最后一个带 cp38 wheel 的版本，板子与本机统一钉死
+    "pymavlink==2.4.47",
+    "loguru>=0.7",
+]
+
+[dependency-groups]
+dev = ["pytest>=7"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+package = false

@@ -166,6 +166,21 @@ UART8 串口。板子**无 WiFi**。
 
 ---
 
+## 5.5 机载自主飞行程序 `flight/`
+
+鲁班猫上的 pymavlink 程序，让 PX4 走 Offboard 完成自检、起飞、悬停、航点和降落。用法、安全行为和**装机首飞检查清单**
+见 `flight/README.md`，任务进度见计划书 7.1。必须知道的几点：
+
+- 链路为鲁班猫 `/dev/ttyS8` ↔ 飞控 U4/TELEM3 `/dev/ttyS3`，波特率 921600（**待实测**），飞控侧靠 SD 卡 `extras.txt` 启动 mavlink。
+- 代码须兼容 **Python 3.8**（板子），pymavlink 钉死 2.4.47；本机测试用 `uv run pytest`。
+- 已在 PX4 v1.16.1 SIH SITL 上跑通，包括故障注入。Gazebo 光流仿真能启动，但容器里没有 GPU，只能做静态检查；实物还没跑。SITL 用法见 `sim/sitl.sh`，PX4 源码放在仓库同级的 `../PX4-Autopilot`。
+- 容器里跑 gz 必须设 `GZ_PARTITION`：容器内的 uid 没有对应用户名，gz 推不出默认分区，会一直卡在等待 world。
+- 默认要求遥控在线、任务文件设了 `min_battery_v` 才起飞；`--no-rc` 只用于拆桨桌面测试或 SITL。
+- PX4 心跳固定 1 Hz，解锁状态/模式最多滞后 1 s——改状态机时别用「心跳显示未解锁」直接判定已上锁。
+- 板子上要在 tmux 里运行：SSH 断线 = SIGHUP = 程序中止（空中降落）。
+
+---
+
 ## 6. 调试工具
 
 **实时预览** `tools/preview.py`（板子侧零依赖，本机解码）：

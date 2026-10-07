@@ -1,0 +1,11 @@
+# 伴随计算机自主飞行所需的 PX4 参数（v1.16.1 commander_params.c 核对）
+# 格式：参数名 值。用 flight/px4/apply_params.py 写入并回读。
+# 只列与出厂/已写入值不同、且与本任务直接相关的项。
+
+# Offboard 设定点中断多久算丢失（s，默认 1.0）。主循环 20 Hz，留足 Python 偶发卡顿余量
+COM_OF_LOSS_T 1.0
+# Offboard 丢失后的动作：4 = Land（默认 0 = Position，无遥控时会一直悬停直到低电）
+# 直接执行，不经 COM_FAIL_ACT_T 的 Hold 延迟（SITL 实测 + v1.16.1 failsafe.cpp checkModeFallback：Offboard 丢失走模式回退，不经 COM_FAIL_ACT_T 的 Hold 延迟）
+COM_OBL_RC_ACT 4
+# 遥控丢失动作：3 = Land（默认 2 = Return，光流无全局位置，Return 不可用）
+NAV_RCL_ACT 3

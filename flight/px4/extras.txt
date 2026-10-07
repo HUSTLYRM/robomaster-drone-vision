@@ -1,0 +1,5 @@
+# 放到飞控 SD 卡 /etc/extras.txt（PX4 rcS 开机时执行，路径 /fs/microsd/etc/extras.txt）
+# 鲁班猫伴随计算机链路：飞控 U4 口 = TELEM3 = /dev/ttyS3，对端鲁班猫 UART8 /dev/ttyS8
+# minimal 模式只开极少默认流，任务程序启动时用 SET_MESSAGE_INTERVAL 显式请求所需消息，
+# 降低鲁班猫侧 Python 解析负载。921600 需上板实测 RK3566 UART 是否稳定（丢包看 mavlink status）。
+mavlink start -d /dev/ttyS3 -b 921600 -m minimal
