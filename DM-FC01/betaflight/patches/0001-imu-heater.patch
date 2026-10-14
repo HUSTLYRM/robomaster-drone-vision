@@ -1,0 +1,1215 @@
+diff --git a/mk/source.mk b/mk/source.mk
+index 43646af99..f24454177 100644
+--- a/mk/source.mk
++++ b/mk/source.mk
+@@ -226,6 +226,7 @@ COMMON_SRC = \
+             sensors/compass.c \
+             sensors/gyro.c \
+             sensors/gyro_init.c \
++            sensors/imu_heater.c \
+             sensors/initialisation.c \
+             sensors/sensors.c \
+             blackbox/blackbox.c \
+diff --git a/src/main/build/debug.c b/src/main/build/debug.c
+index f68fea5c7..220dd8500 100644
+--- a/src/main/build/debug.c
++++ b/src/main/build/debug.c
+@@ -138,4 +138,5 @@ const char * const debugModeNames[DEBUG_COUNT] = {
+     [DEBUG_SAG_COMPENSATION] = "SAG_COMPENSATION",
+     [DEBUG_UPT1] = "UPT1",
+     [DEBUG_FLIGHT_PLAN] = "FLIGHT_PLAN",
++    [DEBUG_IMU_HEATER] = "IMU_HEATER",
+ };
+diff --git a/src/main/build/debug.h b/src/main/build/debug.h
+index 98d14f946..64a6b3a29 100644
+--- a/src/main/build/debug.h
++++ b/src/main/build/debug.h
+@@ -220,6 +220,7 @@ typedef enum {
+     DEBUG_SAG_COMPENSATION,
+     DEBUG_UPT1,
+     DEBUG_FLIGHT_PLAN,
++    DEBUG_IMU_HEATER,
+     DEBUG_COUNT
+ } debugType_e;
+ 
+diff --git a/src/main/cli/cli.c b/src/main/cli/cli.c
+index db2046af3..30cd1ea86 100644
+--- a/src/main/cli/cli.c
++++ b/src/main/cli/cli.c
+@@ -176,6 +176,7 @@ bool cliMode = false;
+ #include "sensors/boardalignment.h"
+ #include "sensors/compass.h"
+ #include "sensors/gyro.h"
++#include "sensors/imu_heater.h"
+ #include "sensors/gyro_init.h"
+ #include "sensors/sensors.h"
+ 
+@@ -7169,6 +7170,9 @@ const cliResourceValue_t resourceTable[] = {
+ #ifdef USE_PINIO
+     DEFA( OWNER_PINIO,         PG_PINIO_CONFIG, pinioConfig_t, ioTag, PINIO_COUNT ),
+ #endif
++#ifdef USE_IMU_HEATER
++    DEFA( OWNER_IMU_HEATER,    PG_IMU_HEATER_CONFIG, imuHeaterConfig_t, ioTag, IMU_HEATER_COUNT ),
++#endif
+ #if defined(USE_USB_MSC)
+     DEFS( OWNER_USB_MSC_PIN,   PG_USB_CONFIG, usbDev_t, mscButtonPin ),
+ #endif
+diff --git a/src/main/cli/settings.c b/src/main/cli/settings.c
+index 9043e7c46..124cf64d6 100644
+--- a/src/main/cli/settings.c
++++ b/src/main/cli/settings.c
+@@ -139,6 +139,7 @@
+ #include "sensors/compass.h"
+ #include "sensors/esc_sensor.h"
+ #include "sensors/gyro.h"
++#include "sensors/imu_heater.h"
+ #include "sensors/rangefinder.h"
+ #include "sensors/opticalflow.h"
+ #include "sensors/sensors.h"
+@@ -1925,6 +1926,12 @@ const clivalue_t valueTable[] = {
+ #endif
+ 
+ // PG_PINIO_CONFIG
++#ifdef USE_IMU_HEATER
++    { "imu_heater_target", VAR_UINT8 | HARDWARE_VALUE, .config.minmaxUnsigned = { 0, IMU_HEATER_TARGET_MAX }, PG_IMU_HEATER_CONFIG, offsetof(imuHeaterConfig_t, targetTemp) },
++    { "imu_heater_p", VAR_UINT8 | HARDWARE_VALUE | MODE_ARRAY, .config.array.length = IMU_HEATER_COUNT, PG_IMU_HEATER_CONFIG, offsetof(imuHeaterConfig_t, kp) },
++    { "imu_heater_i", VAR_UINT8 | HARDWARE_VALUE | MODE_ARRAY, .config.array.length = IMU_HEATER_COUNT, PG_IMU_HEATER_CONFIG, offsetof(imuHeaterConfig_t, ki) },
++    { "imu_heater_ff", VAR_UINT8 | HARDWARE_VALUE | MODE_ARRAY, .config.array.length = IMU_HEATER_COUNT, PG_IMU_HEATER_CONFIG, offsetof(imuHeaterConfig_t, ff) },
++#endif
+ #ifdef USE_PINIO
+     { "pinio_config", VAR_UINT8 | HARDWARE_VALUE | MODE_ARRAY, .config.array.length = PINIO_COUNT, PG_PINIO_CONFIG, offsetof(pinioConfig_t, config) },
+ #ifdef USE_PINIOBOX
+diff --git a/src/main/drivers/accgyro/accgyro.h b/src/main/drivers/accgyro/accgyro.h
+index a137c22a9..300094901 100644
+--- a/src/main/drivers/accgyro/accgyro.h
++++ b/src/main/drivers/accgyro/accgyro.h
+@@ -120,6 +120,7 @@ typedef struct gyroDev_s {
+     int32_t gyroADCRawPrevious[XYZ_AXIS_COUNT];
+     int16_t gyroADCRaw[XYZ_AXIS_COUNT];                      // raw data from sensor
+     int16_t temperature;
++    int16_t temperatureCenti;                                // temperatureFn 同时写入的 0.01 °C 精度温度
+     float tempScale;
+     float tempZero;
+     mpuDetectionResult_t mpuDetectionResult;
+diff --git a/src/main/drivers/accgyro/accgyro_spi_bmi088.c b/src/main/drivers/accgyro/accgyro_spi_bmi088.c
+index 8937250b8..f1aab0785 100644
+--- a/src/main/drivers/accgyro/accgyro_spi_bmi088.c
++++ b/src/main/drivers/accgyro/accgyro_spi_bmi088.c
+@@ -42,6 +42,7 @@
+ 
+ #define BMI088_ACC_REG_CHIP_ID            0x00
+ #define BMI088_ACC_REG_DATA               0x12
++#define BMI088_ACC_REG_TEMP_MSB           0x22
+ #define BMI088_ACC_REG_CONF               0x40
+ #define BMI088_ACC_REG_RANGE              0x41
+ #define BMI088_ACC_REG_PWR_CONF           0x7C
+@@ -133,6 +134,16 @@ static bool bmi088AccReadData(const extDevice_t *dev, uint8_t data[BMI088_AXIS_D
+     return true;
+ }
+ 
++// 手册 5.3.7：11 位补码，MSB 为 [10:3]，LSB 的 [7:5] 为 [2:0]；0.125 °C/LSB，零点 23 °C
++STATIC_UNIT_TESTED int16_t bmi088TemperatureCenti(uint8_t msb, uint8_t lsb)
++{
++    int16_t raw = (int16_t)(((uint16_t)msb << 3) | (lsb >> 5));
++    if (raw > 1023) {
++        raw -= 2048;
++    }
++    return (int16_t)(2300 + (raw * 25) / 2);
++}
++
+ uint8_t bmi088GyroDetect(const extDevice_t *dev)
+ {
+     return spiReadRegMsk(dev, BMI088_GYRO_REG_CHIP_ID) == BMI088_GYRO_CHIP_ID ? BMI_088_SPI : MPU_NONE;
+@@ -198,11 +209,66 @@ static bool bmi088GyroRead(gyroDev_t *gyro)
+     return true;
+ }
+ 
++// 温度传感器在加速度计 die 上。BMI088 不是当前加计时 Betaflight 不会初始化这颗 die，
++// 所以单独建一个设备把它唤醒，给加热器等用途读温度。若之后它被选为加计，
++// bmi088AccInit 会软复位并重新使能，温度读数不受影响。
++static extDevice_t bmi088TempDev[GYRO_COUNT];
++
++static bool bmi088ReadTemperature(gyroDev_t *gyro, int16_t *temperature)
++{
++    const extDevice_t *dev = &bmi088TempDev[gyro->deviceIndex];
++    if (spiIsBusy(dev)) {
++        return false;
++    }
++
++    // 加计读操作在寄存器地址后插一个哑字节
++    uint8_t raw[3];
++    spiReadRegBuf(dev, BMI088_ACC_REG_TEMP_MSB | BMI088_SPI_READ, raw, sizeof(raw));
++    gyro->temperatureCenti = bmi088TemperatureCenti(raw[1], raw[2]);
++    *temperature = gyro->temperatureCenti / 100;
++    return true;
++}
++
++static void bmi088TempInit(gyroDev_t *gyro)
++{
++    if (!gyro->accCsnTag || gyro->deviceIndex >= GYRO_COUNT) {
++        return;
++    }
++
++    extDevice_t *dev = &bmi088TempDev[gyro->deviceIndex];
++    if (!spiSetBusInstance(dev, gyro->spiBus)) {
++        return;
++    }
++
++    dev->busType_u.spi.csnPin = IOGetByTag(gyro->accCsnTag);
++    IOInit(dev->busType_u.spi.csnPin, OWNER_ACC_CS, RESOURCE_INDEX(gyro->deviceIndex));
++    IOConfigGPIO(dev->busType_u.spi.csnPin, SPI_IO_CS_CFG);
++    IOHi(dev->busType_u.spi.csnPin);
++    spiSetClkDivisor(dev, spiCalculateDivider(BMI088_DETECT_SPI_CLK_HZ));
++
++    (void)bmi088AccReadReg(dev, BMI088_ACC_REG_CHIP_ID);
++    delay(1);
++    if (bmi088AccReadReg(dev, BMI088_ACC_REG_CHIP_ID) != BMI088_ACC_CHIP_ID) {
++        return;
++    }
++
++    // 上电默认 suspend，温度只在 active 下每 1.28 s 更新
++    spiWriteReg(dev, BMI088_ACC_REG_PWR_CONF, BMI088_ACC_PWR_ACTIVE);
++    delay(1);
++    spiWriteReg(dev, BMI088_ACC_REG_PWR_CTRL, BMI088_ACC_PWR_ENABLE);
++    delay(1);
++    spiSetClkDivisor(dev, spiCalculateDivider(BMI088_MAX_SPI_CLK_HZ));
++
++    busDeviceRegister(dev);
++    gyro->temperatureFn = bmi088ReadTemperature;
++}
++
+ static void bmi088GyroInit(gyroDev_t *gyro)
+ {
+     bmi088GyroConfig(gyro);
+     bmi088GyroExtiInit(gyro);
+     spiSetClkDivisor(&gyro->dev, spiCalculateDivider(BMI088_MAX_SPI_CLK_HZ));
++    bmi088TempInit(gyro);
+ }
+ 
+ bool bmi088SpiGyroDetect(gyroDev_t *gyro)
+diff --git a/src/main/drivers/accgyro/accgyro_spi_icm456xx.c b/src/main/drivers/accgyro/accgyro_spi_icm456xx.c
+index fbbf0bf43..e68cc859a 100644
+--- a/src/main/drivers/accgyro/accgyro_spi_icm456xx.c
++++ b/src/main/drivers/accgyro/accgyro_spi_icm456xx.c
+@@ -172,6 +172,7 @@ Note: Now implemented only UI Interface with Low-Noise Mode
+ 
+ #define ICM456XX_ACCEL_DATA_X1_UI               0x00
+ #define ICM456XX_GYRO_DATA_X1_UI                0x06
++#define ICM456XX_TEMP_DATA1_UI                  0x0C   // 小端：0x0C 低字节，0x0D 高字节
+ 
+ // ACCEL_CONFIG0 - 0x1B
+ #define ICM456XX_ACCEL_FS_SEL_32G               (0x00 << 4)
+@@ -659,6 +660,23 @@ bool icm456xxGyroReadSPI(gyroDev_t *gyro)
+ }
+ 
+ 
++// TDK 官方驱动 basic_read_registers 示例：温度 = 25 + raw / 128 °C（寄存器值，FIFO 里的系数不同）
++STATIC_UNIT_TESTED int16_t icm456xxTemperatureCenti(int16_t raw)
++{
++    return (int16_t)(2500 + ((int32_t)raw * 100) / 128);
++}
++
++static bool icm456xxReadTemperature(gyroDev_t *gyro, int16_t *temperature)
++{
++    uint8_t raw[2];
++    if (!spiReadRegMskBufRB(&gyro->dev, ICM456XX_TEMP_DATA1_UI, raw, sizeof(raw))) {
++        return false;
++    }
++    gyro->temperatureCenti = icm456xxTemperatureCenti((int16_t)(((uint16_t)raw[1] << 8) | raw[0]));
++    *temperature = gyro->temperatureCenti / 100;
++    return true;
++}
++
+ bool icm456xxSpiGyroDetect(gyroDev_t *gyro)
+ {
+     switch (gyro->mpuDetectionResult.sensor) {
+@@ -666,6 +684,7 @@ bool icm456xxSpiGyroDetect(gyroDev_t *gyro)
+     case ICM_45605_SPI:
+         gyro->initFn = icm456xxGyroInit;
+         gyro->readFn = icm456xxGyroReadSPI;
++        gyro->temperatureFn = icm456xxReadTemperature;
+         break;
+     default:
+         return false;
+diff --git a/src/main/drivers/resource.c b/src/main/drivers/resource.c
+index 2b8609b88..5facf1645 100644
+--- a/src/main/drivers/resource.c
++++ b/src/main/drivers/resource.c
+@@ -125,6 +125,7 @@ static const char * const ownerNames[] = {
+     [OWNER_CAN_RX] = "CAN_RX",
+     [OWNER_CAN_SILENT] = "CAN_SILENT",
+     [OWNER_ACC_CS] = "ACC_CS",
++    [OWNER_IMU_HEATER] = "IMU_HEATER",
+     // Keep in sync with resourceOwner_e.
+ };
+ 
+diff --git a/src/main/drivers/resource.h b/src/main/drivers/resource.h
+index 3c194d4cd..f17f4ddbf 100644
+--- a/src/main/drivers/resource.h
++++ b/src/main/drivers/resource.h
+@@ -121,6 +121,7 @@ typedef enum {
+     OWNER_CAN_RX,
+     OWNER_CAN_SILENT,
+     OWNER_ACC_CS,
++    OWNER_IMU_HEATER,
+     OWNER_TOTAL_COUNT
+ } resourceOwner_e;
+ 
+diff --git a/src/main/fc/init.c b/src/main/fc/init.c
+index 4396ab1a0..e9cce7ef4 100644
+--- a/src/main/fc/init.c
++++ b/src/main/fc/init.c
+@@ -182,6 +182,7 @@
+ #include "sensors/esc_sensor.h"
+ #include "sensors/gyro.h"
+ #include "sensors/gyro_init.h"
++#include "sensors/imu_heater.h"
+ #include "sensors/initialisation.h"
+ 
+ #include "telemetry/telemetry.h"
+@@ -765,6 +766,10 @@ void initPhase3(void)
+     pinioBoxInit(pinioBoxConfig());
+ #endif
+ 
++#ifdef USE_IMU_HEATER
++    imuHeaterInit();
++#endif
++
+ 
+     LED1_ON;
+     LED0_OFF;
+diff --git a/src/main/fc/tasks.c b/src/main/fc/tasks.c
+index d60ff7da3..8ae1d6be7 100644
+--- a/src/main/fc/tasks.c
++++ b/src/main/fc/tasks.c
+@@ -103,6 +103,7 @@
+ #include "sensors/compass.h"
+ #include "sensors/esc_sensor.h"
+ #include "sensors/gyro.h"
++#include "sensors/imu_heater.h"
+ #include "sensors/sensors.h"
+ #include "sensors/rangefinder.h"
+ #include "sensors/opticalflow.h"
+@@ -487,6 +488,10 @@ task_attribute_t task_attributes[TASK_COUNT] = {
+     [TASK_PINIOBOX] = DEFINE_TASK("PINIOBOX", NULL, NULL, pinioBoxUpdate, TASK_PERIOD_HZ(20), TASK_PRIORITY_LOWEST),
+ #endif
+ 
++#ifdef USE_IMU_HEATER
++    [TASK_IMU_HEATER] = DEFINE_TASK("IMU_HEATER", NULL, NULL, imuHeaterUpdate, TASK_PERIOD_HZ(1000), TASK_PRIORITY_LOWEST),
++#endif
++
+ #ifdef USE_RANGEFINDER
+     [TASK_RANGEFINDER] = DEFINE_TASK("RANGEFINDER", NULL, NULL, taskUpdateRangefinder, TASK_PERIOD_HZ(10), TASK_PRIORITY_MEDIUM),
+ #endif
+@@ -710,6 +715,10 @@ void tasksInit(void)
+     pinioBoxTaskControl();
+ #endif
+ 
++#ifdef USE_IMU_HEATER
++    setTaskEnabled(TASK_IMU_HEATER, imuHeaterIsEnabled());
++#endif
++
+ #ifdef USE_CMS
+ #ifdef USE_MSP_DISPLAYPORT
+     setTaskEnabled(TASK_CMS, true);
+diff --git a/src/main/pg/pg_ids.h b/src/main/pg/pg_ids.h
+index f810f597c..3bafcf2aa 100644
+--- a/src/main/pg/pg_ids.h
++++ b/src/main/pg/pg_ids.h
+@@ -168,6 +168,7 @@
+ #define PG_OSD_NAV_MAP_CONFIG       568
+ #define PG_PITOT_CONFIG             569
+ #define PG_LAUNCH_WING_CONFIG       570
++#define PG_IMU_HEATER_CONFIG        571
+ 
+ // TODO TBC
+ #define PG_DISPLAY_PORT_FBOSD_CONFIG 566
+diff --git a/src/main/scheduler/scheduler.h b/src/main/scheduler/scheduler.h
+index 9c3376a26..2de8ec29a 100644
+--- a/src/main/scheduler/scheduler.h
++++ b/src/main/scheduler/scheduler.h
+@@ -195,6 +195,9 @@ typedef enum {
+ #ifdef USE_PINIOBOX
+     TASK_PINIOBOX,
+ #endif
++#ifdef USE_IMU_HEATER
++    TASK_IMU_HEATER,
++#endif
+ #ifdef USE_CRSF_V3
+     TASK_SPEED_NEGOTIATION,
+ #endif
+diff --git a/src/main/sensors/gyro.c b/src/main/sensors/gyro.c
+index 5e3e684d7..4e0e84838 100644
+--- a/src/main/sensors/gyro.c
++++ b/src/main/sensors/gyro.c
+@@ -639,6 +639,21 @@ void gyroReadTemperature(void)
+     gyroSensorTemperature = max_temp;
+ }
+ 
++bool gyroReadSensorTemperatureCenti(int index, int16_t *temperatureCenti)
++{
++    if (index < 0 || index >= GYRO_COUNT) {
++        return false;
++    }
++
++    // 未探测到的陀螺 temperatureFn 为空（gyro 是零初始化的全局量）
++    gyroDev_t *dev = &gyro.gyroSensor[index].gyroDev;
++    if (!dev->temperatureFn || !dev->temperatureFn(dev, &dev->temperature)) {
++        return false;
++    }
++    *temperatureCenti = dev->temperatureCenti;
++    return true;
++}
++
+ int16_t gyroGetTemperature(void)
+ {
+     return gyroSensorTemperature;
+diff --git a/src/main/sensors/gyro.h b/src/main/sensors/gyro.h
+index 98fa62c63..5df80f487 100644
+--- a/src/main/sensors/gyro.h
++++ b/src/main/sensors/gyro.h
+@@ -196,6 +196,7 @@ bool isFirstArmingGyroCalibrationRunning(void);
+ bool gyroIsCalibrationComplete(void);
+ void gyroReadTemperature(void);
+ int16_t gyroGetTemperature(void);
++bool gyroReadSensorTemperatureCenti(int index, int16_t *temperatureCenti);
+ bool gyroOverflowDetected(void);
+ bool gyroYawSpinDetected(void);
+ uint16_t gyroAbsRateDps(int axis);
+diff --git a/src/main/sensors/imu_heater.c b/src/main/sensors/imu_heater.c
+new file mode 100644
+index 000000000..b7e243df1
+--- /dev/null
++++ b/src/main/sensors/imu_heater.c
+@@ -0,0 +1,232 @@
++/*
++ * This file is part of Betaflight.
++ *
++ * Betaflight is free software. You can redistribute this software
++ * and/or modify this software under the terms of the GNU General
++ * Public License as published by the Free Software Foundation,
++ * either version 3 of the License, or (at your option) any later version.
++ *
++ * Betaflight is distributed in the hope that it
++ * will be useful, but WITHOUT ANY WARRANTY; without even the implied
++ * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software.
++ *
++ * If not, see <http://www.gnu.org/licenses/>.
++ */
++
++/*
++ * IMU 恒温加热：每路加热器按对应陀螺的芯片温度做 PI 闭环，GPIO 软件 PWM 输出（周期 100 ms）。
++ * 控制律同 PX4 heater 驱动（前馈 + 比例 + 限幅积分），另加积分抗饱和。
++ * 读数无效、连续读失败或超温时立即关断并清积分。
++ */
++
++#include <math.h>
++#include <stdbool.h>
++#include <stdint.h>
++#include <string.h>
++
++#include "platform.h"
++
++#ifdef USE_IMU_HEATER
++
++#include "build/debug.h"
++
++#include "common/maths.h"
++#include "common/utils.h"
++
++#include "drivers/io.h"
++#include "drivers/resource.h"
++
++#include "pg/pg_ids.h"
++
++#include "sensors/gyro.h"
++
++#include "imu_heater.h"
++
++#ifndef IMU_HEATER_1_PIN
++#define IMU_HEATER_1_PIN NONE
++#endif
++#ifndef IMU_HEATER_2_PIN
++#define IMU_HEATER_2_PIN NONE
++#endif
++
++#ifndef DEFAULT_IMU_HEATER_TARGET
++#define DEFAULT_IMU_HEATER_TARGET 0
++#endif
++
++#ifndef DEFAULT_IMU_HEATER_1_P
++#define DEFAULT_IMU_HEATER_1_P 65
++#endif
++#ifndef DEFAULT_IMU_HEATER_1_I
++#define DEFAULT_IMU_HEATER_1_I 100
++#endif
++#ifndef DEFAULT_IMU_HEATER_1_FF
++#define DEFAULT_IMU_HEATER_1_FF 2
++#endif
++#ifndef DEFAULT_IMU_HEATER_2_P
++#define DEFAULT_IMU_HEATER_2_P 65
++#endif
++#ifndef DEFAULT_IMU_HEATER_2_I
++#define DEFAULT_IMU_HEATER_2_I 100
++#endif
++#ifndef DEFAULT_IMU_HEATER_2_FF
++#define DEFAULT_IMU_HEATER_2_FF 2
++#endif
++
++#define IMU_HEATER_TEMP_MIN_C           -40.0f  // 读数超出此范围视为无效
++#define IMU_HEATER_TEMP_MAX_C           80.0f
++#define IMU_HEATER_OVERTEMP_MARGIN_C    10.0f   // 高于目标这么多直接关断
++#define IMU_HEATER_INTEGRATOR_LIMIT     0.25f   // 与 PX4 一致
++#define IMU_HEATER_FAIL_LIMIT           10      // 连续读失败次数（控制周期 0.1 s，约 1 s）
++#define IMU_HEATER_CONTROL_PERIOD_US    100000
++// 加热器满功率升温 >2 °C/s（实测），PWM 周期须远短于热响应，否则单个开周期就会过冲
++#define IMU_HEATER_PWM_PERIOD_US        100000  // 任务 1 kHz 运行，占空比分辨率 1%
++#define IMU_HEATER_MAX_DT_US            1000000
++
++typedef struct imuHeaterGains_s {
++    float kp;   // 占空比/°C
++    float ki;   // 占空比/(°C·s)
++    float ff;   // 占空比
++} imuHeaterGains_t;
++
++typedef struct imuHeater_s {
++    IO_t io;
++    float integrator;
++    float duty;
++    int16_t temperatureCenti;
++    uint8_t failCount;
++} imuHeater_t;
++
++static imuHeater_t heaters[IMU_HEATER_COUNT];
++static bool heaterEnabled;
++static timeUs_t lastControlUs;
++static bool controlStarted;
++
++PG_REGISTER_WITH_RESET_FN(imuHeaterConfig_t, imuHeaterConfig, PG_IMU_HEATER_CONFIG, 0);
++
++void pgResetFn_imuHeaterConfig(imuHeaterConfig_t *config)
++{
++    config->ioTag[0] = IO_TAG(IMU_HEATER_1_PIN);
++    config->ioTag[1] = IO_TAG(IMU_HEATER_2_PIN);
++    config->targetTemp = DEFAULT_IMU_HEATER_TARGET;
++    config->kp[0] = DEFAULT_IMU_HEATER_1_P;
++    config->ki[0] = DEFAULT_IMU_HEATER_1_I;
++    config->ff[0] = DEFAULT_IMU_HEATER_1_FF;
++    config->kp[1] = DEFAULT_IMU_HEATER_2_P;
++    config->ki[1] = DEFAULT_IMU_HEATER_2_I;
++    config->ff[1] = DEFAULT_IMU_HEATER_2_FF;
++}
++
++// 返回 0..1 的占空比；dtS 为距上次调用的秒数，首次调用传 0
++STATIC_UNIT_TESTED float imuHeaterControl(float *integrator, const imuHeaterGains_t *gains,
++                                          float targetC, bool tempValid, float tempC, float dtS)
++{
++    if (targetC <= 0.0f || !tempValid
++        || tempC < IMU_HEATER_TEMP_MIN_C || tempC > IMU_HEATER_TEMP_MAX_C
++        || tempC >= targetC + IMU_HEATER_OVERTEMP_MARGIN_C) {
++        *integrator = 0.0f;
++        return 0.0f;
++    }
++
++    const float error = targetC - tempC;
++    const float unclamped = gains->ff + gains->kp * error + *integrator;
++
++    // 输出已饱和且误差仍推向饱和方向时不再积分，避免升温段积满后过冲
++    const bool saturatedHigh = unclamped >= 1.0f && error > 0.0f;
++    const bool saturatedLow = unclamped <= 0.0f && error < 0.0f;
++    if (!saturatedHigh && !saturatedLow) {
++        *integrator = constrainf(*integrator + gains->ki * error * dtS,
++                                 -IMU_HEATER_INTEGRATOR_LIMIT, IMU_HEATER_INTEGRATOR_LIMIT);
++    }
++
++    return constrainf(gains->ff + gains->kp * error + *integrator, 0.0f, 1.0f);
++}
++
++// 软件 PWM：周期 100 ms，前 duty 部分为开
++STATIC_UNIT_TESTED bool imuHeaterPwmState(float duty, timeUs_t nowUs)
++{
++    // 先把开时间取整到微秒再比较，避免浮点误差让边界抖动
++    return (int32_t)(nowUs % IMU_HEATER_PWM_PERIOD_US) < lrintf(duty * IMU_HEATER_PWM_PERIOD_US);
++}
++
++void imuHeaterInit(void)
++{
++    memset(heaters, 0, sizeof(heaters));
++    heaterEnabled = false;
++    controlStarted = false;
++
++    for (int i = 0; i < IMU_HEATER_COUNT; i++) {
++        imuHeater_t *heater = &heaters[i];
++        heater->io = IOGetByTag(imuHeaterConfig()->ioTag[i]);
++        if (!heater->io) {
++            continue;
++        }
++
++        IOInit(heater->io, OWNER_IMU_HEATER, RESOURCE_INDEX(i));
++        IOConfigGPIO(heater->io, IOCFG_OUT_PP);
++        IOLo(heater->io);
++        heater->failCount = IMU_HEATER_FAIL_LIMIT;  // 拿到第一个有效读数之前不加热
++        heaterEnabled = true;
++    }
++}
++
++bool imuHeaterIsEnabled(void)
++{
++    return heaterEnabled;
++}
++
++static void imuHeaterControlStep(float dtS)
++{
++    const imuHeaterConfig_t *config = imuHeaterConfig();
++    const float targetC = MIN(config->targetTemp, IMU_HEATER_TARGET_MAX);
++
++    for (int i = 0; i < IMU_HEATER_COUNT; i++) {
++        imuHeater_t *heater = &heaters[i];
++        if (!heater->io) {
++            continue;
++        }
++
++        int16_t temperatureCenti;
++        if (gyroReadSensorTemperatureCenti(i, &temperatureCenti)) {
++            heater->temperatureCenti = temperatureCenti;
++            heater->failCount = 0;
++        } else if (heater->failCount < IMU_HEATER_FAIL_LIMIT) {
++            heater->failCount++;
++        }
++
++        const imuHeaterGains_t gains = {
++            .kp = config->kp[i] / 100.0f,
++            .ki = config->ki[i] / 1000.0f,
++            .ff = config->ff[i] / 100.0f,
++        };
++        heater->duty = imuHeaterControl(&heater->integrator, &gains, targetC,
++                                        heater->failCount < IMU_HEATER_FAIL_LIMIT,
++                                        heater->temperatureCenti / 100.0f, dtS);
++
++        DEBUG_SET(DEBUG_IMU_HEATER, 2 * i, heater->temperatureCenti);  //!< [index:0,2] Heater {1|2} Temperature [unit:0.01degC]
++        DEBUG_SET(DEBUG_IMU_HEATER, 2 * i + 1, lrintf(heater->duty * 1000.0f));  //!< [index:1,3] Heater {1|2} Duty [unit:0.001]
++    }
++}
++
++void imuHeaterUpdate(timeUs_t currentTimeUs)
++{
++    const timeDelta_t sinceControlUs = cmpTimeUs(currentTimeUs, lastControlUs);
++    if (!controlStarted || sinceControlUs >= IMU_HEATER_CONTROL_PERIOD_US) {
++        // 调度长时间停顿后 dt 封顶 1 s，防止积分一次跳太多
++        const float dtS = controlStarted ? MIN(sinceControlUs, IMU_HEATER_MAX_DT_US) * 1e-6f : 0.0f;
++        lastControlUs = currentTimeUs;
++        controlStarted = true;
++        imuHeaterControlStep(dtS);
++    }
++
++    for (int i = 0; i < IMU_HEATER_COUNT; i++) {
++        if (heaters[i].io) {
++            IOWrite(heaters[i].io, imuHeaterPwmState(heaters[i].duty, currentTimeUs));
++        }
++    }
++}
++
++#endif // USE_IMU_HEATER
+diff --git a/src/main/sensors/imu_heater.h b/src/main/sensors/imu_heater.h
+new file mode 100644
+index 000000000..e42eaf798
+--- /dev/null
++++ b/src/main/sensors/imu_heater.h
+@@ -0,0 +1,45 @@
++/*
++ * This file is part of Betaflight.
++ *
++ * Betaflight is free software. You can redistribute this software
++ * and/or modify this software under the terms of the GNU General
++ * Public License as published by the Free Software Foundation,
++ * either version 3 of the License, or (at your option) any later version.
++ *
++ * Betaflight is distributed in the hope that it
++ * will be useful, but WITHOUT ANY WARRANTY; without even the implied
++ * warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
++ * See the GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this software.
++ *
++ * If not, see <http://www.gnu.org/licenses/>.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++#include <stdint.h>
++
++#include "common/time.h"
++#include "drivers/io_types.h"
++#include "pg/pg.h"
++
++// 第 i 路加热器用第 i 颗陀螺（GYRO_1、GYRO_2）的芯片温度闭环
++#define IMU_HEATER_COUNT        2
++#define IMU_HEATER_TARGET_MAX   65      // °C
++
++typedef struct imuHeaterConfig_s {
++    ioTag_t ioTag[IMU_HEATER_COUNT];
++    uint8_t targetTemp;                 // 目标温度 °C，0 = 关闭
++    uint8_t kp[IMU_HEATER_COUNT];       // 比例：占空比 %/°C
++    uint8_t ki[IMU_HEATER_COUNT];       // 积分：占空比 0.1 %/(°C·s)
++    uint8_t ff[IMU_HEATER_COUNT];       // 前馈：占空比 %
++} imuHeaterConfig_t;
++
++PG_DECLARE(imuHeaterConfig_t, imuHeaterConfig);
++
++void imuHeaterInit(void);
++bool imuHeaterIsEnabled(void);
++void imuHeaterUpdate(timeUs_t currentTimeUs);
+diff --git a/src/test/Makefile b/src/test/Makefile
+index 694352d85..2bd498c63 100644
+--- a/src/test/Makefile
++++ b/src/test/Makefile
+@@ -130,6 +130,19 @@ baro_ms5611_unittest_DEFINES := \
+                 USE_BARO_MS5611= \
+                 USE_BARO_SPI_MS5611=
+ 
++accgyro_spi_icm456xx_unittest_SRC := \
++		$(USER_DIR)/drivers/accgyro/accgyro_spi_icm456xx.c
++
++accgyro_spi_icm456xx_unittest_DEFINES := \
++		USE_ACCGYRO_ICM45686= \
++		USE_ACCGYRO_ICM45605=
++
++imu_heater_unittest_SRC := \
++		$(USER_DIR)/sensors/imu_heater.c
++
++imu_heater_unittest_DEFINES := \
++		USE_IMU_HEATER=
++
+ accgyro_spi_icm426xx_unittest_SRC := \
+ 		$(USER_DIR)/drivers/accgyro/accgyro_spi_icm426xx.c
+ 
+diff --git a/src/test/unit/accgyro_spi_bmi088_unittest.cc b/src/test/unit/accgyro_spi_bmi088_unittest.cc
+index adaa7807b..1ca70ceb3 100644
+--- a/src/test/unit/accgyro_spi_bmi088_unittest.cc
++++ b/src/test/unit/accgyro_spi_bmi088_unittest.cc
+@@ -23,6 +23,7 @@ STATIC_UNIT_TESTED uint16_t bmi088AccOneG(bool highFsr);
+ STATIC_UNIT_TESTED uint8_t bmi088AccRange(bool highFsr);
+ STATIC_UNIT_TESTED uint8_t bmi088GyroBandwidth(uint8_t hardwareLpf);
+ STATIC_UNIT_TESTED void bmi088DecodeLittleEndian(const uint8_t raw[6], int16_t data[XYZ_AXIS_COUNT]);
++STATIC_UNIT_TESTED int16_t bmi088TemperatureCenti(uint8_t msb, uint8_t lsb);
+ 
+ }
+ 
+@@ -37,6 +38,8 @@ static bool returnGyroData;
+ static uint8_t lastAccelReadReg;
+ static uint8_t lastAccelReadLength;
+ static uint32_t elapsedUs;
++static uint8_t mockedTempMsb;
++static uint8_t mockedTempLsb;
+ 
+ typedef struct writeRecord_s {
+     uint8_t reg;
+@@ -201,6 +204,79 @@ TEST(AccgyroSpiBmi088, ObservesSuspendWriteDelayAndPowerUpDelay)
+     EXPECT_GE(writeRecords[4].timestampUs - writeRecords[3].timestampUs, 2u);
+ }
+ 
++TEST(AccgyroSpiBmi088, DecodesElevenBitTemperature)
++{
++    // 0x22 为 [10:3]，0x23 的 [7:5] 为 [2:0]；0.125 °C/LSB，零点 23 °C
++    EXPECT_EQ(2300, bmi088TemperatureCenti(0x00, 0x00));
++    EXPECT_EQ(4800, bmi088TemperatureCenti(200 >> 3, 0x00));          // +25 °C
++    EXPECT_EQ(2312, bmi088TemperatureCenti(0x00, 0x20));               // 一个 LSB，12.5 截断为 12
++    EXPECT_EQ(15087, bmi088TemperatureCenti(0x7f, 0xe0));              // 1023：正向最大
++    EXPECT_EQ(-10500, bmi088TemperatureCenti(0x80, 0x00));             // 1024 → -1024
++    EXPECT_EQ(2288, bmi088TemperatureCenti(0xff, 0xe0));               // 2047 → -1
++    EXPECT_EQ(2300, bmi088TemperatureCenti(0x00, 0x1f));               // LSB 低 5 位无效
++}
++
++TEST(AccgyroSpiBmi088, GyroInitWithoutAccChipSelectHasNoTemperature)
++{
++    gyroDev_t gyro = {};
++    gyro.mpuDetectionResult.sensor = BMI_088_SPI;
++    ASSERT_TRUE(bmi088SpiGyroDetect(&gyro));
++
++    resetBusMocks();
++    gyro.initFn(&gyro);
++    EXPECT_EQ(nullptr, gyro.temperatureFn);
++    EXPECT_EQ(0u, registeredDeviceCount);
++}
++
++TEST(AccgyroSpiBmi088, GyroInitRejectsOutOfRangeDeviceIndexForTemperature)
++{
++    gyroDev_t gyro = {};
++    accDev_t acc = {};
++    configureBmi088Accelerometer(&gyro, &acc);
++    gyro.deviceIndex = GYRO_COUNT;
++    ASSERT_TRUE(bmi088SpiGyroDetect(&gyro));
++
++    resetBusMocks();
++    gyro.initFn(&gyro);
++    EXPECT_EQ(nullptr, gyro.temperatureFn);
++    EXPECT_EQ(0u, registeredDeviceCount);
++}
++
++TEST(AccgyroSpiBmi088, GyroInitWakesAccelerometerDieForTemperature)
++{
++    gyroDev_t gyro = {};
++    accDev_t acc = {};
++    configureBmi088Accelerometer(&gyro, &acc);
++    gyro.deviceIndex = 0;   // 测试环境未定义 GYRO_n，GYRO_COUNT 为 1
++    ASSERT_TRUE(bmi088SpiGyroDetect(&gyro));
++
++    resetBusMocks();
++    gyro.initFn(&gyro);
++
++    ASSERT_NE(nullptr, gyro.temperatureFn);
++    EXPECT_EQ(1u, registeredDeviceCount);
++    EXPECT_EQ(2u, accelReadCount);  // 先切 SPI，再核对 ID
++
++    // 陀螺配置写完之后应依次写加计 PWR_CONF=active、PWR_CTRL=enable，且间隔 ≥ 1 ms
++    ASSERT_GE(writeRecordCount, 2u);
++    const writeRecord_t &conf = writeRecords[writeRecordCount - 2];
++    const writeRecord_t &ctrl = writeRecords[writeRecordCount - 1];
++    EXPECT_EQ(0x7c, conf.reg);
++    EXPECT_EQ(0x00, conf.value);
++    EXPECT_EQ(0x7d, ctrl.reg);
++    EXPECT_EQ(0x04, ctrl.value);
++    EXPECT_GE(ctrl.timestampUs - conf.timestampUs, 1000u);
++
++    mockedTempMsb = 200 >> 3;
++    mockedTempLsb = 0x00;
++    int16_t degC = 0;
++    ASSERT_TRUE(gyro.temperatureFn(&gyro, &degC));
++    EXPECT_EQ(0xa2, lastAccelReadReg);      // TEMP_MSB | 读位
++    EXPECT_EQ(3, lastAccelReadLength);      // 哑字节 + MSB + LSB
++    EXPECT_EQ(4800, gyro.temperatureCenti);
++    EXPECT_EQ(48, degC);
++}
++
+ TEST(AccgyroSpiBmi088, UsesExtiOnlyAfterSustainedStartupPulses)
+ {
+     gyroDev_t gyro = {};
+@@ -249,6 +325,10 @@ void spiReadRegBuf(const extDevice_t *, uint8_t reg, uint8_t *data, uint8_t leng
+     if (length == 2) {
+         data[0] = 0xff; // BMI088 accelerometer's mandatory dummy byte
+         data[1] = accelReadCount++ ? BMI088_ACC_CHIP_ID : 0x00;
++    } else if (length == 3) {
++        data[0] = 0xff;
++        data[1] = mockedTempMsb;
++        data[2] = mockedTempLsb;
+     } else if (length == 7 && returnAccelData) {
+         static const uint8_t raw[7] = { 0xee, 0x34, 0x12, 0x00, 0x80, 0xff, 0x7f };
+         for (unsigned i = 0; i < sizeof(raw); i++) {
+diff --git a/src/test/unit/accgyro_spi_icm456xx_unittest.cc b/src/test/unit/accgyro_spi_icm456xx_unittest.cc
+new file mode 100644
+index 000000000..7aaa034e8
+--- /dev/null
++++ b/src/test/unit/accgyro_spi_icm456xx_unittest.cc
+@@ -0,0 +1,102 @@
++/*
++ * This file is part of Betaflight.
++ *
++ * Betaflight is free software. You can redistribute this software
++ * and/or modify this software under the terms of the GNU General
++ * Public License as published by the Free Software Foundation,
++ * either version 3 of the License, or (at your option) any later version.
++ */
++
++#include <stdint.h>
++
++extern "C" {
++
++#include "platform.h"
++#include "drivers/accgyro/accgyro.h"
++#include "drivers/accgyro/accgyro_mpu.h"
++#include "drivers/accgyro/accgyro_spi_icm456xx.h"
++#include "sensors/gyro.h"
++
++STATIC_UNIT_TESTED int16_t icm456xxTemperatureCenti(int16_t raw);
++
++}
++
++#include "gtest/gtest.h"
++
++static uint8_t lastReadReg;
++static uint8_t lastReadLength;
++static bool readOk;
++static uint8_t mockedTemp[2];
++
++TEST(AccgyroSpiIcm456xx, ConvertsRegisterTemperature)
++{
++    // TDK 示例：25 + raw / 128 °C
++    EXPECT_EQ(2500, icm456xxTemperatureCenti(0));
++    EXPECT_EQ(4800, icm456xxTemperatureCenti(23 * 128));
++    EXPECT_EQ(2000, icm456xxTemperatureCenti(-5 * 128));
++    EXPECT_EQ(2500, icm456xxTemperatureCenti(1));        // 0.78 centi 截断
++    EXPECT_EQ(28099, icm456xxTemperatureCenti(INT16_MAX));
++    EXPECT_EQ(-23100, icm456xxTemperatureCenti(INT16_MIN));
++}
++
++TEST(AccgyroSpiIcm456xx, DetectInstallsTemperatureReader)
++{
++    gyroDev_t gyro = {};
++    gyro.mpuDetectionResult.sensor = ICM_45686_SPI;
++    ASSERT_TRUE(icm456xxSpiGyroDetect(&gyro));
++    ASSERT_NE(nullptr, gyro.temperatureFn);
++
++    // 小端：0x0C 为低字节
++    const int16_t raw = 23 * 128;
++    mockedTemp[0] = raw & 0xff;
++    mockedTemp[1] = (raw >> 8) & 0xff;
++    readOk = true;
++    int16_t degC = 0;
++    ASSERT_TRUE(gyro.temperatureFn(&gyro, &degC));
++    EXPECT_EQ(0x0c, lastReadReg);
++    EXPECT_EQ(2, lastReadLength);
++    EXPECT_EQ(4800, gyro.temperatureCenti);
++    EXPECT_EQ(48, degC);
++}
++
++TEST(AccgyroSpiIcm456xx, TemperatureReadFailureIsReported)
++{
++    gyroDev_t gyro = {};
++    gyro.mpuDetectionResult.sensor = ICM_45686_SPI;
++    ASSERT_TRUE(icm456xxSpiGyroDetect(&gyro));
++    gyro.temperatureCenti = 1234;
++
++    readOk = false;
++    int16_t degC = 0;
++    EXPECT_FALSE(gyro.temperatureFn(&gyro, &degC));
++    EXPECT_EQ(1234, gyro.temperatureCenti);
++}
++
++extern "C" {
++
++// 驱动其余部分的链接桩，本测试不走这些路径
++uint8_t armingFlags;
++gyroConfig_t gyroConfig_System;
++uint32_t clockMicrosToCycles(uint32_t micros) { return micros; }
++void delay(uint32_t) {}
++void delayMicroseconds(uint32_t) {}
++void mpuGyroInit(gyroDev_t *) {}
++uint16_t spiCalculateDivider(uint32_t) { return 2; }
++void spiSetClkDivisor(const extDevice_t *, uint16_t) {}
++uint8_t spiReadRegMsk(const extDevice_t *, uint8_t) { return 0; }
++void spiWriteReg(const extDevice_t *, uint8_t, uint8_t) {}
++void spiWriteRegBuf(const extDevice_t *, uint8_t, uint8_t *, uint32_t) {}
++
++bool spiReadRegMskBufRB(const extDevice_t *, uint8_t reg, uint8_t *data, uint8_t length)
++{
++    lastReadReg = reg;
++    lastReadLength = length;
++    if (!readOk || length != 2) {
++        return false;
++    }
++    data[0] = mockedTemp[0];
++    data[1] = mockedTemp[1];
++    return true;
++}
++
++}
+diff --git a/src/test/unit/imu_heater_unittest.cc b/src/test/unit/imu_heater_unittest.cc
+new file mode 100644
+index 000000000..1bd63d63e
+--- /dev/null
++++ b/src/test/unit/imu_heater_unittest.cc
+@@ -0,0 +1,298 @@
++/*
++ * This file is part of Betaflight.
++ *
++ * Betaflight is free software. You can redistribute this software
++ * and/or modify this software under the terms of the GNU General
++ * Public License as published by the Free Software Foundation,
++ * either version 3 of the License, or (at your option) any later version.
++ */
++
++#include <stdint.h>
++
++extern "C" {
++
++#include "platform.h"
++#include "build/debug.h"
++#include "drivers/io.h"
++#include "pg/pg.h"
++#include "pg/pg_ids.h"
++#include "sensors/gyro.h"
++#include "sensors/imu_heater.h"
++
++typedef struct imuHeaterGains_s {
++    float kp;
++    float ki;
++    float ff;
++} imuHeaterGains_t;
++
++STATIC_UNIT_TESTED float imuHeaterControl(float *integrator, const imuHeaterGains_t *gains,
++                                          float targetC, bool tempValid, float tempC, float dtS);
++STATIC_UNIT_TESTED bool imuHeaterPwmState(float duty, timeUs_t nowUs);
++
++int16_t debug[DEBUG16_VALUE_COUNT];
++uint8_t debugMode;
++
++}
++
++#include "gtest/gtest.h"
++
++static const imuHeaterGains_t gains = { .kp = 0.65f, .ki = 0.1f, .ff = 0.02f };
++
++TEST(ImuHeater, OffWhenTargetIsZero)
++{
++    float integrator = 0.1f;
++    EXPECT_FLOAT_EQ(0.0f, imuHeaterControl(&integrator, &gains, 0.0f, true, 20.0f, 0.1f));
++    EXPECT_FLOAT_EQ(0.0f, integrator);
++}
++
++TEST(ImuHeater, OffAndResetWhenTemperatureInvalid)
++{
++    float integrator = 0.1f;
++    EXPECT_FLOAT_EQ(0.0f, imuHeaterControl(&integrator, &gains, 48.0f, false, 20.0f, 0.1f));
++    EXPECT_FLOAT_EQ(0.0f, integrator);
++}
++
++TEST(ImuHeater, OffWhenReadingOutsidePlausibleRange)
++{
++    float integrator = 0.0f;
++    EXPECT_FLOAT_EQ(0.0f, imuHeaterControl(&integrator, &gains, 48.0f, true, -40.5f, 0.1f));
++    EXPECT_FLOAT_EQ(0.0f, imuHeaterControl(&integrator, &gains, 48.0f, true, 80.5f, 0.1f));
++    // 边界本身仍可加热
++    EXPECT_GT(imuHeaterControl(&integrator, &gains, 48.0f, true, -40.0f, 0.0f), 0.0f);
++}
++
++TEST(ImuHeater, OffAtOvertempMargin)
++{
++    float integrator = 0.2f;
++    EXPECT_FLOAT_EQ(0.0f, imuHeaterControl(&integrator, &gains, 48.0f, true, 58.0f, 0.1f));
++    EXPECT_FLOAT_EQ(0.0f, integrator);
++}
++
++TEST(ImuHeater, ProportionalPlusFeedForward)
++{
++    float integrator = 0.0f;
++    const imuHeaterGains_t pOnly = { .kp = 0.65f, .ki = 0.0f, .ff = 0.02f };
++    EXPECT_NEAR(0.67f, imuHeaterControl(&integrator, &pOnly, 48.0f, true, 47.0f, 0.1f), 1e-6f);
++    // 高于目标：P 项为负，扣到 0 为止
++    EXPECT_FLOAT_EQ(0.0f, imuHeaterControl(&integrator, &pOnly, 48.0f, true, 49.0f, 0.1f));
++}
++
++TEST(ImuHeater, IntegratesNearTarget)
++{
++    float integrator = 0.0f;
++    imuHeaterControl(&integrator, &gains, 48.0f, true, 47.5f, 0.1f);
++    EXPECT_NEAR(0.005f, integrator, 1e-6f);
++}
++
++TEST(ImuHeater, IntegratorClampedToQuarter)
++{
++    float integrator = 0.0f;
++    const imuHeaterGains_t iOnly = { .kp = 0.0f, .ki = 1.0f, .ff = 0.0f };
++    for (int i = 0; i < 100; i++) {
++        imuHeaterControl(&integrator, &iOnly, 48.0f, true, 47.0f, 0.1f);
++    }
++    EXPECT_FLOAT_EQ(0.25f, integrator);
++
++    // 负向：前馈够大、输出始终未触底时，积分才会一路降到下限
++    const imuHeaterGains_t iWithFf = { .kp = 0.0f, .ki = 1.0f, .ff = 0.5f };
++    for (int i = 0; i < 100; i++) {
++        imuHeaterControl(&integrator, &iWithFf, 48.0f, true, 49.0f, 0.1f);
++    }
++    EXPECT_FLOAT_EQ(-0.25f, integrator);
++}
++
++TEST(ImuHeater, NoWindupWhileSaturatedHigh)
++{
++    float integrator = 0.0f;
++    // 冷启动 20 °C：P 项远超 1，输出打满，积分不应累积
++    for (int i = 0; i < 50; i++) {
++        EXPECT_FLOAT_EQ(1.0f, imuHeaterControl(&integrator, &gains, 48.0f, true, 20.0f, 0.1f));
++    }
++    EXPECT_FLOAT_EQ(0.0f, integrator);
++}
++
++TEST(ImuHeater, NoWindupWhileSaturatedLow)
++{
++    float integrator = 0.0f;
++    for (int i = 0; i < 50; i++) {
++        EXPECT_FLOAT_EQ(0.0f, imuHeaterControl(&integrator, &gains, 48.0f, true, 52.0f, 0.1f));
++    }
++    EXPECT_FLOAT_EQ(0.0f, integrator);
++}
++
++TEST(ImuHeater, FirstCallDoesNotIntegrate)
++{
++    float integrator = 0.0f;
++    imuHeaterControl(&integrator, &gains, 48.0f, true, 47.5f, 0.0f);
++    EXPECT_FLOAT_EQ(0.0f, integrator);
++}
++
++TEST(ImuHeater, PwmHundredMillisecondPeriod)
++{
++    EXPECT_FALSE(imuHeaterPwmState(0.0f, 0));
++    EXPECT_FALSE(imuHeaterPwmState(0.0f, 99999));
++    EXPECT_TRUE(imuHeaterPwmState(1.0f, 0));
++    EXPECT_TRUE(imuHeaterPwmState(1.0f, 99999));
++    EXPECT_TRUE(imuHeaterPwmState(0.3f, 29999));
++    EXPECT_FALSE(imuHeaterPwmState(0.3f, 30000));
++    EXPECT_TRUE(imuHeaterPwmState(0.3f, 1000000 + 10000));    // 跨周期回绕
++    EXPECT_FALSE(imuHeaterPwmState(0.3f, 1000000 + 70000));
++}
++
++// ---- 集成：任务更新、读失败关断、引脚输出 ----
++
++static bool tempOk[2];
++static int16_t tempCenti[2];
++static unsigned tempReads[2];
++static bool pinHigh[2];
++
++static int pinIndex(IO_t io)
++{
++    return static_cast<int>(reinterpret_cast<uintptr_t>(io)) - 1;   // ioTag 1/2 → 引脚 0/1
++}
++
++static void setupHeaters(void)
++{
++    imuHeaterConfig_t *config = imuHeaterConfigMutable();
++    config->ioTag[0] = 1;
++    config->ioTag[1] = 2;
++    config->targetTemp = 48;
++    config->kp[0] = 65;  config->ki[0] = 100; config->ff[0] = 2;
++    config->kp[1] = 20;  config->ki[1] = 0;   config->ff[1] = 4;
++    for (int i = 0; i < 2; i++) {
++        tempOk[i] = false;
++        tempCenti[i] = 0;
++        tempReads[i] = 0;
++        pinHigh[i] = true;      // 初始化必须把它拉低
++    }
++    debugMode = DEBUG_IMU_HEATER;
++    imuHeaterInit();
++}
++
++TEST(ImuHeater, InitDrivesPinsLow)
++{
++    setupHeaters();
++    EXPECT_TRUE(imuHeaterIsEnabled());
++    EXPECT_FALSE(pinHigh[0]);
++    EXPECT_FALSE(pinHigh[1]);
++}
++
++TEST(ImuHeater, NoPinsMeansDisabled)
++{
++    setupHeaters();
++    imuHeaterConfigMutable()->ioTag[0] = 0;
++    imuHeaterConfigMutable()->ioTag[1] = 0;
++    imuHeaterInit();
++    EXPECT_FALSE(imuHeaterIsEnabled());
++}
++
++TEST(ImuHeater, StaysOffUntilFirstValidReading)
++{
++    setupHeaters();
++    imuHeaterUpdate(0);
++    EXPECT_FALSE(pinHigh[0]);
++    EXPECT_FALSE(pinHigh[1]);
++    EXPECT_EQ(1u, tempReads[0]);
++
++    tempOk[0] = true;
++    tempCenti[0] = 2000;    // 20 °C，远低于目标，占空比打满
++    imuHeaterUpdate(100000);
++    EXPECT_TRUE(pinHigh[0]);
++    EXPECT_FALSE(pinHigh[1]);   // 第二路一直读不到
++    EXPECT_EQ(1000, debug[1]);
++    EXPECT_EQ(2000, debug[0]);
++}
++
++TEST(ImuHeater, ControlRunsAtTenHertz)
++{
++    setupHeaters();
++    tempOk[0] = true;
++    tempCenti[0] = 2000;
++    imuHeaterUpdate(0);
++    imuHeaterUpdate(10000);
++    imuHeaterUpdate(99999);
++    EXPECT_EQ(1u, tempReads[0]);
++    imuHeaterUpdate(100000);
++    EXPECT_EQ(2u, tempReads[0]);
++}
++
++TEST(ImuHeater, ShutsOffAfterConsecutiveReadFailures)
++{
++    setupHeaters();
++    tempOk[0] = true;
++    tempCenti[0] = 2000;
++    timeUs_t t = 0;
++    imuHeaterUpdate(t);
++    ASSERT_TRUE(pinHigh[0]);
++
++    // 偶发失败沿用上次读数，不关断
++    tempOk[0] = false;
++    for (int i = 0; i < 9; i++) {
++        t += 100000;
++        imuHeaterUpdate(t);
++        EXPECT_TRUE(pinHigh[0]) << i;
++    }
++    // 连续第 10 次失败：关断
++    t += 100000;
++    imuHeaterUpdate(t);
++    EXPECT_FALSE(pinHigh[0]);
++    EXPECT_EQ(0, debug[1]);
++
++    // 恢复读数后重新加热
++    tempOk[0] = true;
++    t += 100000;
++    imuHeaterUpdate(t);
++    EXPECT_TRUE(pinHigh[0]);
++}
++
++TEST(ImuHeater, SoftwarePwmBetweenControlSteps)
++{
++    setupHeaters();
++    imuHeaterConfigMutable()->ki[0] = 0;
++    tempOk[0] = true;
++    tempCenti[0] = 4750;    // 差 0.5 °C：0.02 + 0.65 × 0.5 = 0.345
++    imuHeaterUpdate(0);
++    EXPECT_EQ(345, debug[1]);
++    EXPECT_TRUE(pinHigh[0]);
++    imuHeaterUpdate(20000);
++    EXPECT_TRUE(pinHigh[0]);
++    imuHeaterUpdate(34000);
++    EXPECT_TRUE(pinHigh[0]);
++    imuHeaterUpdate(35000);
++    EXPECT_FALSE(pinHigh[0]);
++    imuHeaterUpdate(99000);
++    EXPECT_FALSE(pinHigh[0]);
++}
++
++TEST(ImuHeater, IntegratorStepCappedAfterSchedulerStall)
++{
++    setupHeaters();
++    imuHeaterConfigMutable()->kp[0] = 0;
++    imuHeaterConfigMutable()->ff[0] = 0;
++    imuHeaterConfigMutable()->ki[0] = 100;  // 0.1 /(°C·s)
++    tempOk[0] = true;
++    tempCenti[0] = 4700;                    // 差 1 °C
++    imuHeaterUpdate(0);
++    imuHeaterUpdate(5000000);               // 停顿 5 s，按 1 s 计：0.1 × 1 × 1
++    EXPECT_EQ(100, debug[1]);
++}
++
++extern "C" {
++
++bool gyroReadSensorTemperatureCenti(int index, int16_t *temperature)
++{
++    tempReads[index]++;
++    if (!tempOk[index]) {
++        return false;
++    }
++    *temperature = tempCenti[index];
++    return true;
++}
++
++IO_t IOGetByTag(ioTag_t tag) { return reinterpret_cast<IO_t>(static_cast<uintptr_t>(tag)); }
++void IOInit(IO_t, resourceOwner_e, uint8_t) {}
++void IOConfigGPIO(IO_t, ioConfig_t) {}
++void IOLo(IO_t io) { pinHigh[pinIndex(io)] = false; }
++void IOWrite(IO_t io, bool hi) { pinHigh[pinIndex(io)] = hi; }
++
++}
