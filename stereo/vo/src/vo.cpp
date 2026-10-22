@@ -36,6 +36,18 @@ cv::Matx44d inverse(const cv::Matx44d& T) {
   return Ti;
 }
 
+cv::Point3d transformPoint(const cv::Matx44d& T, const cv::Point3f& P) {
+  return {T(0, 0) * P.x + T(0, 1) * P.y + T(0, 2) * P.z + T(0, 3), T(1, 0) * P.x + T(1, 1) * P.y + T(1, 2) * P.z + T(1, 3),
+          T(2, 0) * P.x + T(2, 1) * P.y + T(2, 2) * P.z + T(2, 3)};
+}
+
+// 把增量运动按比例缩放（旋转按轴角缩放），用于按真实时间间隔外推恒速运动
+cv::Matx44d scaleMotion(const cv::Matx44d& T, double k) {
+  cv::Mat rvec, tvec;
+  toRt(T, rvec, tvec);
+  return fromRt(rvec * k, tvec * k);
+}
+
 bool inside(const cv::Point2f& p, const cv::Size& s, float margin) {
   return p.x >= margin && p.y >= margin && p.x < s.width - margin && p.y < s.height - margin;
 }
@@ -87,7 +99,7 @@ bool poseIsPlausible(const cv::Matx44d& T_c_kf, const cv::Matx44d& T_kf_c_prev, 
 }
 
 StereoVO::StereoVO(const StereoCalib& calib, const VoParams& params)
-    : calib_(calib), p_(params), K_(calib.rectK()) {}
+    : calib_(calib), p_(params), K_(calib.rectK()), orb_(cv::ORB::create()) {}
 
 bool StereoVO::makeKeyframe(const cv::Mat& left, const cv::Mat& right, const std::vector<cv::Point2f>& seeds) {
   std::vector<cv::Point2f> pts = seeds;
@@ -133,17 +145,91 @@ bool StereoVO::makeKeyframe(const cv::Mat& left, const cv::Mat& right, const std
   pts3_ = std::move(pts3);
   kf_initial_points_ = static_cast<int>(pts_.size());
   prev_left_ = left.clone();
+  kf_left_ = left.clone();  // 必须单独一份：prev_left_ 每帧 copyTo 原地覆盖，共享像素会被改写
+  kf_pts_ = pts_;
+  kf_pts3_ = pts3_;
   T_w_kf_ = T_w_c_;
   T_kf_c_ = cv::Matx44d::eye();
   has_kf_ = true;
   return true;
 }
 
-VoResult StereoVO::process(const cv::Mat& left, const cv::Mat& right) {
+bool StereoVO::relocalize(const cv::Mat& left, double now) {
+  if (!snap_.valid || now - snap_.t > p_.reloc_max_age || snap_.pts.size() < static_cast<size_t>(p_.reloc_min_inliers)) {
+    return false;
+  }
+  // 两边都用「方向固定为 0」的 ORB 描述子：快照点是外部给的、ORB 不会替它算方向，
+  // 若当前帧让 ORB 自己检测（带方向），两边旋转基准不同就匹配不上（合成测试实测）。
+  // 短时丢失期间绕光轴转动小，不需要旋转不变
+  std::vector<cv::KeyPoint> ks;
+  for (size_t i = 0; i < snap_.pts.size(); ++i) ks.emplace_back(snap_.pts[i], 31.f, 0.f, 0.f, 0, static_cast<int>(i));
+  cv::Mat ds;
+  orb_->compute(snap_.image, ks, ds);  // 贴边的点会被删掉，靠 class_id 找回原序号
+  std::vector<cv::Point2f> corners;
+  cv::goodFeaturesToTrack(left, corners, 1000, p_.gftt_quality, 7);
+  std::vector<cv::KeyPoint> kc;
+  for (const auto& c : corners) kc.emplace_back(c, 31.f, 0.f);
+  cv::Mat dc;
+  orb_->compute(left, kc, dc);
+  if (ds.empty() || dc.empty()) return false;
+  std::vector<cv::DMatch> matches;
+  cv::BFMatcher(cv::NORM_HAMMING, true).match(ds, dc, matches);
+  std::vector<cv::Point3d> obj;
+  std::vector<cv::Point2f> raw;
+  for (const auto& m : matches) {
+    if (m.distance > 64) continue;  // 汉明距离太大的不要
+    obj.push_back(snap_.pts_w[ks[m.queryIdx].class_id]);
+    raw.push_back(kc[m.trainIdx].pt);
+  }
+  if (static_cast<int>(obj.size()) < p_.reloc_min_inliers) return false;
+  std::vector<cv::Point2f> img;
+  calib_.rectifyLeft(raw, img);
+  cv::Mat rvec, tvec;
+  std::vector<int> inl;
+  if (!cv::solvePnPRansac(obj, img, K_, cv::noArray(), rvec, tvec, false, 200, p_.reloc_reproj, 0.99, inl, cv::SOLVEPNP_EPNP) ||
+      static_cast<int>(inl.size()) < p_.reloc_min_inliers) {
+    return false;
+  }
+  std::vector<cv::Point3d> obj_in;
+  std::vector<cv::Point2f> img_in;
+  for (int i : inl) {
+    obj_in.push_back(obj[i]);
+    img_in.push_back(img[i]);
+  }
+  cv::solvePnPRefineLM(obj_in, img_in, K_, cv::noArray(), rvec, tvec);
+  const cv::Matx44d T_c_w = fromRt(rvec, tvec);
+  for (const auto& P : obj_in) {
+    if (T_c_w(2, 0) * P.x + T_c_w(2, 1) * P.y + T_c_w(2, 2) * P.z + T_c_w(2, 3) <= 0) return false;
+  }
+  // 与丢失前位姿相比运动过大，多半是错配
+  const cv::Matx44d step = inverse(snap_.T_w_c) * inverse(T_c_w);
+  const double trans = std::sqrt(step(0, 3) * step(0, 3) + step(1, 3) * step(1, 3) + step(2, 3) * step(2, 3));
+  const double ang = std::acos(std::clamp((step(0, 0) + step(1, 1) + step(2, 2) - 1.0) / 2.0, -1.0, 1.0)) * 180.0 / CV_PI;
+  if (trans > p_.reloc_max_translation || ang > p_.reloc_max_rotation_deg) return false;
+  T_w_c_ = inverse(T_c_w);
+  return true;
+}
+
+void StereoVO::afterReinit(const cv::Mat& left, double now, VoResult& r) {
+  if (!pending_reset_) return;
+  pending_reset_ = false;
+  if (p_.relocalize && relocalize(left, now)) {
+    T_w_kf_ = T_w_c_;  // 刚建的关键帧就是当前帧
+    r.relocalized = true;
+  } else {
+    ++reset_count_;
+  }
+  snap_.valid = false;
+}
+
+VoResult StereoVO::process(const cv::Mat& left, const cv::Mat& right, double t) {
   const auto t0 = std::chrono::steady_clock::now();
+  const double now = t >= 0 ? t : static_cast<double>(frame_idx_);
+  ++frame_idx_;
   VoResult r;
   auto finish = [&]() {
     r.reset_count = reset_count_;
+    r.lost_count = lost_count_;
     r.keyframe_points = static_cast<int>(pts3_.size());
     r.T_w_c = T_w_c_;
     r.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -154,13 +240,45 @@ VoResult StereoVO::process(const cv::Mat& left, const cv::Mat& right) {
     // 首帧位姿定义为原点；之后的建关键帧失败（看不到纹理）不改位姿
     r.ok = makeKeyframe(left, right, {});
     r.new_keyframe = r.ok;
+    if (r.ok) {
+      t_valid_ = now;
+      afterReinit(left, now, r);
+    }
     return finish();
   }
 
+  // 运动预测：上一有效位姿 × 恒速增量（按时间比例缩放），作 KLT 与 PnP 初值
+  cv::Matx44d T_kf_c_guess = T_kf_c_;
   std::vector<cv::Point2f> cur;
   std::vector<uchar> ok;
   std::vector<float> err;
-  trackBidirectional(prev_left_, left, pts_, cur, ok, err, p_, false);
+  bool tracked_with_prior = false;
+  if (p_.use_motion_prior && has_vel_ && vel_dt_ > 0) {
+    T_kf_c_guess = T_kf_c_ * scaleMotion(vel_, std::clamp((now - t_valid_) / vel_dt_, 0.0, 5.0));
+    const cv::Matx44d T_c_kf_guess = inverse(T_kf_c_guess);
+    std::vector<cv::Point3d> pc;
+    pc.reserve(pts3_.size());
+    for (const auto& P : pts3_) pc.emplace_back(transformPoint(T_c_kf_guess, P));
+    calib_.projectLeftRaw(pc, cur);
+    for (size_t i = 0; i < cur.size(); ++i) {
+      if (cur[i].x < 0) cur[i] = pts_[i];  // 预测到相机背后的点退回上一帧位置
+    }
+    trackBidirectional(prev_left_, left, pts_, cur, ok, err, p_, true);
+    tracked_with_prior = true;
+  }
+  const auto alive = [](const std::vector<uchar>& v) { return static_cast<size_t>(std::count(v.begin(), v.end(), 1)); };
+  if (!tracked_with_prior || alive(ok) < pts_.size() / 2) {
+    // 没有预测，或预测不准（急停/急转向）存活不到一半：按零运动再跟一次，取存活多的
+    std::vector<cv::Point2f> cur0;
+    std::vector<uchar> ok0;
+    std::vector<float> err0;
+    trackBidirectional(prev_left_, left, pts_, cur0, ok0, err0, p_, false);
+    if (!tracked_with_prior || alive(ok0) > alive(ok)) {
+      cur.swap(cur0);
+      ok.swap(ok0);
+      T_kf_c_guess = T_kf_c_;
+    }
+  }
   std::vector<cv::Point2f> img;
   std::vector<cv::Point3f> obj;
   std::vector<cv::Point2f> raw_kept;
@@ -176,20 +294,35 @@ VoResult StereoVO::process(const cv::Mat& left, const cv::Mat& right) {
   cv::Mat rvec, tvec;
   if (r.tracked >= p_.min_pnp_inliers) {
     calib_.rectifyLeft(raw_kept, img);
-    toRt(inverse(T_kf_c_), rvec, tvec);  // solvePnP 求的是 T_c_kf
+    toRt(inverse(T_kf_c_guess), rvec, tvec);  // solvePnP 求的是 T_c_kf
     pnp_ok = cv::solvePnPRansac(obj, img, K_, cv::noArray(), rvec, tvec, true, p_.ransac_iters, p_.ransac_reproj,
                                 0.99, inl, cv::SOLVEPNP_ITERATIVE) &&
              static_cast<int>(inl.size()) >= p_.min_pnp_inliers;
   }
 
   auto lose = [&]() {
-    // 丢失：位姿停在上一个有效值，在当前帧重建关键帧；建不成就等下一帧继续试
-    ++reset_count_;
+    // 丢失：位姿停在上一个有效值，存下最近关键帧作重定位快照，在当前帧重建关键帧；建不成就等下一帧继续试
+    ++lost_count_;
+    snap_.valid = !kf_left_.empty() && !kf_pts_.empty();
+    if (snap_.valid) {
+      snap_.image = kf_left_;
+      snap_.pts = kf_pts_;
+      snap_.pts_w.clear();
+      for (const auto& P : kf_pts3_) snap_.pts_w.push_back(transformPoint(T_w_kf_, P));
+      snap_.T_w_c = T_w_c_;
+      snap_.t = now;
+    }
+    pending_reset_ = true;
     rejected_in_row_ = 0;
     has_kf_ = false;
+    has_vel_ = false;  // 丢失前的速度不可信，重新积累
     pts_.clear();
     pts3_.clear();
-    if (makeKeyframe(left, right, {})) r.new_keyframe = true;
+    if (makeKeyframe(left, right, {})) {
+      r.new_keyframe = true;
+      t_valid_ = now;
+      afterReinit(left, now, r);
+    }
     return finish();
   };
   if (!pnp_ok) return lose();
@@ -210,7 +343,14 @@ VoResult StereoVO::process(const cv::Mat& left, const cv::Mat& right) {
     return finish();
   }
   rejected_in_row_ = 0;
-  T_kf_c_ = inverse(T_c_kf);
+  const cv::Matx44d T_kf_c_new = inverse(T_c_kf);
+  if (now > t_valid_) {
+    vel_ = inverse(T_kf_c_) * T_kf_c_new;  // 相机系增量 T_cprev_ccur（两者同一关键帧系）
+    vel_dt_ = now - t_valid_;
+    has_vel_ = true;
+  }
+  t_valid_ = now;
+  T_kf_c_ = T_kf_c_new;
   T_w_c_ = T_w_kf_ * T_kf_c_;
   r.ok = true;
   r.inliers = static_cast<int>(inl.size());

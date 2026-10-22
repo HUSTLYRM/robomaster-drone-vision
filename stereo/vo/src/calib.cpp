@@ -56,6 +56,23 @@ void StereoCalib::rectifyRight(const std::vector<cv::Point2f>& raw, std::vector<
   cv::undistortPoints(raw, rect, K2, D2, R2, P2);
 }
 
+void StereoCalib::projectLeftRaw(const std::vector<cv::Point3d>& pts_rect, std::vector<cv::Point2f>& raw) const {
+  raw.assign(pts_rect.size(), cv::Point2f(-1.f, -1.f));
+  if (pts_rect.empty()) return;
+  const cv::Matx33d R1t = cv::Matx33d(R1).t();
+  std::vector<cv::Point3d> cam;
+  std::vector<size_t> idx;
+  for (size_t i = 0; i < pts_rect.size(); ++i) {
+    if (pts_rect[i].z <= 0) continue;  // 相机背后的点投影无意义
+    cam.emplace_back(R1t * cv::Vec3d(pts_rect[i].x, pts_rect[i].y, pts_rect[i].z));
+    idx.push_back(i);
+  }
+  if (cam.empty()) return;
+  std::vector<cv::Point2d> out;
+  cv::projectPoints(cam, cv::Vec3d(0, 0, 0), cv::Vec3d(0, 0, 0), K1, D1, out);
+  for (size_t k = 0; k < idx.size(); ++k) raw[idx[k]] = cv::Point2f(static_cast<float>(out[k].x), static_cast<float>(out[k].y));
+}
+
 void StereoCalib::guessRightRaw(const std::vector<cv::Point2f>& left_rect, double disparity,
                                 std::vector<cv::Point2f>& right_raw) const {
   right_raw.clear();

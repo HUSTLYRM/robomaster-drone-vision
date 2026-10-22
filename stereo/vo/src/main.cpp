@@ -92,7 +92,7 @@ PoseFlu toFlu(const cv::Matx44d& T) {
 }
 
 struct Stats {
-  int frames = 0, ok = 0, keyframes = 0, skipped = 0, resets = 0;
+  int frames = 0, ok = 0, keyframes = 0, skipped = 0, resets = 0, lost = 0, relocalized = 0;
   std::vector<double> ms;
   std::vector<int> inliers;
   bool has_start = false;
@@ -105,6 +105,8 @@ struct Stats {
     ms.push_back(r.ms);
     keyframes += r.new_keyframe;
     resets = r.reset_count;
+    lost = r.lost_count;
+    relocalized += r.relocalized;
     if (!r.ok) return;
     ++ok;
     inliers.push_back(r.inliers);
@@ -127,8 +129,8 @@ double median(std::vector<T> v) {
 void printSummary(const Stats& s, double wall_s) {
   const double closure = s.has_start ? cv::norm(s.last - s.start) : 0;
   std::printf("==== 汇总 ====\n");
-  std::printf("处理 %d 帧（%.1f Hz），有效 %d，丢失重置 %d 次，关键帧 %d，相机侧丢帧 %d\n", s.frames,
-              wall_s > 0 ? s.frames / wall_s : 0.0, s.ok, s.resets, s.keyframes, s.skipped);
+  std::printf("处理 %d 帧（%.1f Hz），有效 %d，跟丢 %d 次（重定位接回 %d，位姿重置 %d），关键帧 %d，相机侧丢帧 %d\n", s.frames,
+              wall_s > 0 ? s.frames / wall_s : 0.0, s.ok, s.lost, s.relocalized, s.resets, s.keyframes, s.skipped);
   std::printf("耗时中位 %.2f ms，最大 %.2f ms；内点中位 %.0f\n", median(s.ms),
               s.ms.empty() ? 0.0 : *std::max_element(s.ms.begin(), s.ms.end()), median(s.inliers));
   std::printf("路程 %.3f m，首尾距离 %.3f m（%.2f%% 路程）\n", s.path, closure,
@@ -174,7 +176,7 @@ int run(const Args& a) {
   std::ofstream csv;
   if (!a.csv.empty()) {
     csv.open(a.csv);
-    csv << "t,ok,x,y,z,qw,qx,qy,qz,inliers,tracked,new_kf,reset_count,ms\n";
+    csv << "t,ok,x,y,z,qw,qx,qy,qz,inliers,tracked,new_kf,reset_count,ms,lost_count,relocalized\n";
   }
   Stats st;
   V4l2Stereo cam;
@@ -219,13 +221,13 @@ int run(const Args& a) {
     if (t0 < 0) t0 = t;
     if (a.seconds > 0 && t - t0 > a.seconds) break;
 
-    const auto res = vo.process(l, r);
+    const auto res = vo.process(l, r, t);
     const auto f = toFlu(res.T_w_c);
     st.add(res, f, skipped);
     if (csv.is_open()) {
       csv << std::fixed << t << ',' << res.ok << ',' << f.p[0] << ',' << f.p[1] << ',' << f.p[2] << ',' << f.q[0] << ','
           << f.q[1] << ',' << f.q[2] << ',' << f.q[3] << ',' << res.inliers << ',' << res.tracked << ','
-          << res.new_keyframe << ',' << res.reset_count << ',' << res.ms << '\n';
+          << res.new_keyframe << ',' << res.reset_count << ',' << res.ms << ',' << res.lost_count << ',' << res.relocalized << '\n';
     }
     if (a.viz) {
       const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();

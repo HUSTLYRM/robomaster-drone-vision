@@ -27,4 +27,6 @@ struct StereoCalib {
   // 校正后左目坐标 + 假设视差 -> 右目原始像素坐标，用作左右 KLT 的初值（两目主点差几十像素，不给初值容易跟丢）
   void guessRightRaw(const std::vector<cv::Point2f>& left_rect, double disparity,
                      std::vector<cv::Point2f>& right_raw) const;
+  // 校正后左目相机系的 3D 点 -> 左目原始像素（运动预测给 KLT 初值用）；z <= 0 的点输出 (-1,-1)
+  void projectLeftRaw(const std::vector<cv::Point3d>& pts_rect, std::vector<cv::Point2f>& raw) const;
 };

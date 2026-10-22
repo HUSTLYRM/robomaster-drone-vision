@@ -11,7 +11,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 add_compile_options(-Wall -Wextra)
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d video imgcodecs highgui)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d video features2d imgcodecs highgui)
 
 add_library(vo_core src/calib.cpp src/vo.cpp)
 target_include_directories(vo_core PUBLIC src)

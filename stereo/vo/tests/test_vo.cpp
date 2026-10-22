@@ -214,28 +214,90 @@ TEST(PoseIsPlausible, RejectsBehindCameraAndJumps) {
   EXPECT_TRUE(poseIsPlausible(far, cv::Matx44d(far).inv(), pts, p));
 }
 
-TEST(StereoVO, LostThenRecovers) {
+// 偏航 ±20° 正弦摆动，每帧最多转 6°（100 Hz 下即 600°/s，超出 KLT 金字塔范围）
+int fastYawLostFrames(bool prior, double* worst) {
+  const auto scene = makeScene();
+  VoParams p;
+  p.use_motion_prior = prior;
+  StereoVO vo(idealCalib(), p);
+  int lost = 0;
+  *worst = 0;
+  for (int i = 0; i < 60; ++i) {
+    const double yaw = 20.0 * std::sin(0.3 * i) * CV_PI / 180;
+    cv::Matx44d T = cv::Matx44d::eye();
+    T(0, 0) = std::cos(yaw);
+    T(0, 2) = std::sin(yaw);
+    T(2, 0) = -std::sin(yaw);
+    T(2, 2) = std::cos(yaw);
+    T(0, 3) = 0.002 * i;
+    const auto r = vo.process(render(scene, T), render(scene, rightOf(T)), i * 0.01);
+    lost += !r.ok;
+    *worst = std::max(*worst, cv::norm(cv::Vec3d(r.T_w_c(0, 3) - T(0, 3), r.T_w_c(1, 3) - T(1, 3), r.T_w_c(2, 3) - T(2, 3))));
+  }
+  return lost;
+}
+
+TEST(StereoVO, FastRotationNeedsMotionPrior) {
+  double worst_with = 0, worst_without = 0;
+  const int with = fastYawLostFrames(true, &worst_with);
+  const int without = fastYawLostFrames(false, &worst_without);
+  // 实测：有预测丢 2 帧（开头尚无速度）、最坏 3.6 mm；无预测丢 24 帧
+  EXPECT_LE(with, 3);
+  EXPECT_LT(worst_with, 0.01);
+  EXPECT_GE(without, 10) << "无预测也跟得住，说明这个用例没测到运动预测";
+}
+
+double posErr(const cv::Matx44d& a, const cv::Matx44d& b) {
+  return cv::norm(cv::Vec3d(a(0, 3) - b(0, 3), a(1, 3) - b(1, 3), a(2, 3) - b(2, 3)));
+}
+
+TEST(StereoVO, LostThenRelocalizes) {
+  // 镜头被挡期间相机继续移动；恢复后靠重定位接回，位姿与真值连续、不算重置
   const auto scene = makeScene();
   StereoVO vo(idealCalib());
+  double tt = 0;  // 按 100 Hz 给时间戳（重定位快照有效期按秒算）
+  auto step = [&](const cv::Mat& l, const cv::Mat& r) { tt += 0.01; return vo.process(l, r, tt); };
   const cv::Mat blank(kSize, CV_8UC1, cv::Scalar(128));
-  for (int i = 0; i < 3; ++i) ASSERT_TRUE(vo.process(render(scene, poseAt(i)), render(scene, rightOf(poseAt(i)))).ok);
-  const auto last_ok = vo.process(render(scene, poseAt(3)), render(scene, rightOf(poseAt(3))));
+  for (int i = 0; i < 3; ++i) ASSERT_TRUE(step(render(scene, poseAt(i)), render(scene, rightOf(poseAt(i)))).ok);
+  const auto last_ok = step(render(scene, poseAt(3)), render(scene, rightOf(poseAt(3))));
   ASSERT_TRUE(last_ok.ok);
 
-  const auto lost = vo.process(blank, blank);  // 镜头被挡
+  const auto lost = step(blank, blank);
   EXPECT_FALSE(lost.ok);
-  EXPECT_EQ(lost.reset_count, 1);
+  EXPECT_EQ(lost.lost_count, 1);
+  EXPECT_EQ(lost.reset_count, 0);  // 还没定论：等重建关键帧时看能否重定位
   EXPECT_EQ(lost.T_w_c, last_ok.T_w_c);  // 位姿停在最后有效值
+  for (int k = 0; k < 4; ++k) EXPECT_FALSE(step(blank, blank).ok);
 
-  const auto again = vo.process(blank, blank);
-  EXPECT_FALSE(again.ok);
-
-  const auto back = vo.process(render(scene, poseAt(4)), render(scene, rightOf(poseAt(4))));
-  EXPECT_TRUE(back.ok);  // 重新建关键帧
+  // 挡了 5 帧，相机走到第 10 帧位置（约 12 cm、偏 2°）才恢复
+  const auto back = step(render(scene, poseAt(10)), render(scene, rightOf(poseAt(10))));
+  EXPECT_TRUE(back.ok);
   EXPECT_TRUE(back.new_keyframe);
-  const auto next = vo.process(render(scene, poseAt(5)), render(scene, rightOf(poseAt(5))));
+  EXPECT_TRUE(back.relocalized);
+  EXPECT_EQ(back.reset_count, 0);
+  EXPECT_LT(posErr(back.T_w_c, poseAt(10)), 0.01) << "重定位后应接回真值，而不是停在丢失前";
+  const auto next = step(render(scene, poseAt(11)), render(scene, rightOf(poseAt(11))));
   EXPECT_TRUE(next.ok);
-  EXPECT_EQ(next.reset_count, 1);
+  EXPECT_LT(posErr(next.T_w_c, poseAt(11)), 0.01);
+}
+
+TEST(StereoVO, LostIntoNewSceneCountsReset) {
+  // 恢复后看到的是完全不同的场景（快照里的点一个都不在）：重定位必须失败、记一次重置，而不是错配出一个位姿
+  const auto scene = makeScene();
+  std::vector<Plane> other = makeScene();
+  for (size_t i = 0; i < other.size(); ++i) other[i].texture = makeTexture(other[i].texture.cols, other[i].texture.rows, 6, 100 + i);
+  StereoVO vo(idealCalib());
+  double tt = 0;  // 按 100 Hz 给时间戳（重定位快照有效期按秒算）
+  auto step = [&](const cv::Mat& l, const cv::Mat& r) { tt += 0.01; return vo.process(l, r, tt); };
+  const cv::Mat blank(kSize, CV_8UC1, cv::Scalar(128));
+  for (int i = 0; i < 4; ++i) ASSERT_TRUE(step(render(scene, poseAt(i)), render(scene, rightOf(poseAt(i)))).ok);
+  const auto last_ok = step(render(scene, poseAt(4)), render(scene, rightOf(poseAt(4))));
+  EXPECT_FALSE(step(blank, blank).ok);
+  const auto back = step(render(other, poseAt(5)), render(other, rightOf(poseAt(5))));
+  EXPECT_TRUE(back.ok);
+  EXPECT_FALSE(back.relocalized);
+  EXPECT_EQ(back.reset_count, 1);
+  EXPECT_EQ(back.T_w_c, last_ok.T_w_c);  // 无法接回：从丢失前位姿重新起算
 }
 
 namespace {
