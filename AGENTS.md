@@ -267,7 +267,8 @@ USB 双目相机接在笔记本上做纯视觉双目里程计（开发评估阶�
 - **机载 VO 用 C++ 轻量版 `stereo/vo/`**（丸子定：要轻量、用 C++）：单进程单线程、无 ROS，只依赖 OpenCV（只用 4.2 起就有的接口，照顾板上 apt 版）。
   关键帧 + KLT + 只校正特征点 + 双目三角化 + PnP RANSAC/LM，不建图不做 BA；V4L2 直读、排空队列只处理最新帧。
   构建/测试：`cmake -S stereo/vo -B stereo/vo/build && cmake --build stereo/vo/build -j4 && stereo/vo/build/test_vo`；
-  运行：`stereo/vo/build/stereo_vo [--csv x.csv] [--seconds N] [--exposure N]`，`--record DIR` 录 PGM 序列，`--replay DIR [--skip 3]` 离线回放。
+  运行：`stereo/vo/build/stereo_vo [--csv x.csv] [--seconds N] [--exposure N]`，`--record DIR` 录 PGM 序列，`--replay DIR [--skip 3]` 离线回放，
+  `--viz 1` 预览窗口（左目 + 跟踪点按深度着色 + 俯视轨迹，回放时按录制时间实时播放，q 退出；只用于调试，机载不开）。
   输出位姿为 FLU（前左上），原点 = 首个关键帧左目光心。MAVLink 输出与上板未做。
   - gtest 7 个（合成双目，变异测试确认能抓尺度错、位姿乘反、遮挡点不过滤、每帧换关键帧；另测 PnP 合理性检查）：最频繁换关键帧时最坏误差 0.79% 路程、0.10°。
   - **遮挡边界点**左右看到不同东西，前后向 KLT 检查拦不住但残差大，深度可错 33%：按左右 KLT 残差自适应剔除（> 4×中位数且 > 2）。

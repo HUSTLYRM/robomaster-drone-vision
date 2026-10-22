@@ -4,6 +4,8 @@
 //   录制：  stereo_vo --record logs/stereo_seq/xxx --seconds 20        （只存图，不跑 VO，PGM + times.txt）
 //   回放：  stereo_vo --replay logs/stereo_seq/xxx [--skip 3] [--csv out.csv]   （skip 3 = 100 fps 序列按 33 fps 处理）
 //   其他：  --device /dev/video4  --swap-lr 0|1  --exposure N（0 自动）  --gain N（-1 不改）
+//           --viz 1  预览窗口（左目+跟踪点按深度着色、俯视轨迹；回放时按录制时间实时播放；q 退出）
+//           --viz-scale 0.8  预览窗口初始缩放（窗口可拖拽缩放、可最大化）
 //
 // 输出位姿换算到 FLU（x 前 y 左 z 上），世界系原点 = 第一个关键帧时的左目光心。Ctrl+C 结束并打印汇总。
 #include <algorithm>
@@ -17,6 +19,7 @@
 #include <iostream>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <linux/videodev2.h>
@@ -25,6 +28,7 @@
 
 #include "calib.hpp"
 #include "v4l2_stereo.hpp"
+#include "viz.hpp"
 #include "vo.hpp"
 
 namespace {
@@ -36,9 +40,9 @@ struct Args {
   std::string calib = "stereo/calib/1280x480/stereo.yml";
   std::string device = "/dev/video4";
   std::string record, replay, csv;
-  bool swap_lr = false;
+  bool swap_lr = false, viz = false;
   int exposure = 0, gain = -1, skip = 1;
-  double seconds = 0;
+  double seconds = 0, viz_scale = 0.8;
 };
 
 Args parseArgs(int argc, char** argv) {
@@ -57,6 +61,8 @@ Args parseArgs(int argc, char** argv) {
     else if (k == "--gain") a.gain = std::stoi(v);
     else if (k == "--skip") a.skip = std::max(1, std::stoi(v));
     else if (k == "--seconds") a.seconds = std::stod(v);
+    else if (k == "--viz") a.viz = v == "1";
+    else if (k == "--viz-scale") a.viz_scale = std::stod(v);
     else throw std::runtime_error("未知参数 " + k);
   }
   return a;
@@ -191,7 +197,8 @@ int run(const Args& a) {
   }
 
   const auto wall0 = std::chrono::steady_clock::now();
-  double t0 = -1, last_print = 0;
+  double t0 = -1, last_print = 0, last_viz = 0, viz_fps = 0;
+  VoViz viz(a.viz_scale);
   cv::Mat l, r;
   while (!g_stop) {
     double t;
@@ -219,6 +226,18 @@ int run(const Args& a) {
       csv << std::fixed << t << ',' << res.ok << ',' << f.p[0] << ',' << f.p[1] << ',' << f.p[2] << ',' << f.q[0] << ','
           << f.q[1] << ',' << f.q[2] << ',' << f.q[3] << ',' << res.inliers << ',' << res.tracked << ','
           << res.new_keyframe << ',' << res.reset_count << ',' << res.ms << '\n';
+    }
+    if (a.viz) {
+      const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - wall0).count();
+      if (!a.replay.empty()) {
+        // 回放按录制时间戳实时播放，看起来和现场一致
+        const double ahead = (t - t0) - now;
+        if (ahead > 0) std::this_thread::sleep_for(std::chrono::duration<double>(ahead));
+      }
+      const double dt = now - last_viz;
+      viz_fps = dt > 0 ? 0.9 * viz_fps + 0.1 / dt : viz_fps;
+      last_viz = now;
+      if (!viz.show(l, vo, res, f.p, f.yaw_deg, viz_fps)) break;
     }
     if (t - last_print > 2.0) {
       std::printf("[%5d 帧] %s 内点 %3d 跟踪 %3d %.1f ms | 位置 前%+.3f 左%+.3f 上%+.3f m 偏航 %+.1f° | 路程 %.2f m 重置 %d\n",

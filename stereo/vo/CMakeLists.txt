@@ -11,13 +11,13 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 add_compile_options(-Wall -Wextra)
 
-find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d video imgcodecs)
+find_package(OpenCV REQUIRED COMPONENTS core imgproc calib3d video imgcodecs highgui)
 
 add_library(vo_core src/calib.cpp src/vo.cpp)
 target_include_directories(vo_core PUBLIC src)
 target_link_libraries(vo_core PUBLIC ${OpenCV_LIBS})
 
-add_executable(stereo_vo src/main.cpp src/v4l2_stereo.cpp)
+add_executable(stereo_vo src/main.cpp src/v4l2_stereo.cpp src/viz.cpp)
 target_link_libraries(stereo_vo PRIVATE vo_core)
 
 option(VO_BUILD_TESTS "构建 gtest 单测" ON)

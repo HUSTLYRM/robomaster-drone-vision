@@ -67,8 +67,10 @@ class StereoVO {
   // left/right：原始（未校正）8 位灰度图
   VoResult process(const cv::Mat& left, const cv::Mat& right);
 
-  // 单测用：当前关键帧的 3D 点（关键帧系）
+  // 当前跟踪中的关键帧 3D 点（关键帧系），与 trackedPoints() 同序；单测和预览用
   const std::vector<cv::Point3f>& keyframePoints() const { return pts3_; }
+  // 这些点在最近一帧左目原始图上的位置（预览画点用）
+  const std::vector<cv::Point2f>& trackedPoints() const { return pts_; }
 
  private:
   bool makeKeyframe(const cv::Mat& left, const cv::Mat& right, const std::vector<cv::Point2f>& seeds);
